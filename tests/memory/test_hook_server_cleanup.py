@@ -84,3 +84,32 @@ async def test_cleanup_when_storage_equals_rendezvous(tmp_path, monkeypatch):
     finally:
         await runner.cleanup()
     assert not (storage_base / "serve.port").exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_leaves_port_files_owned_by_another_server(tmp_path, monkeypatch):
+    """Two `cce serve` on one project: the second start overwrites the port
+    files. When the first one exits it must not delete them, or the hooks of
+    the server still running lose their rendezvous."""
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    storage_base = tmp_path / "storage"
+    storage_base.mkdir()
+    port_file = storage_base / "serve.port"
+    rendezvous = fake_home / ".cce" / "projects" / "proj_shared" / "serve.port"
+
+    first, _ = await start_hook_server(storage_base=storage_base, project_name="proj_shared")
+    second, second_port = await start_hook_server(
+        storage_base=storage_base, project_name="proj_shared",
+    )
+    try:
+        await first.cleanup()
+        assert port_file.read_text() == str(second_port)
+        assert rendezvous.read_text() == str(second_port)
+    finally:
+        await second.cleanup()
+
+    assert not port_file.exists()
+    assert not rendezvous.exists()

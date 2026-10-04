@@ -61,6 +61,10 @@ async def start_hook_server(
         except Exception:
             log.exception("memory_db close failed")
 
+    # Filled once the site is bound; the app is frozen by then, so the port
+    # lives in this closure rather than in app state.
+    bound: dict[str, int] = {}
+
     async def _unlink_port_files(app):
         # Covers graceful shutdown paths only. SIGKILL bypasses
         # `app.on_cleanup` entirely, so the residual-port-file class of
@@ -68,9 +72,21 @@ async def start_hook_server(
         # in the hook shell script. What this handler does cleanly cover
         # is the orderly SIGINT/SIGTERM/Ctrl-D path so the next session
         # doesn't inherit a stale serve.port from a normal exit.
+        #
+        # Several `cce serve` processes can share one project (one per
+        # agent session, or several agents on the same repo). Each start
+        # overwrites the port files with its own port, so by the time this
+        # one exits they may name another live server: only remove a file
+        # that still holds *this* server's port, or the survivors' hooks
+        # lose their rendezvous.
+        own = bound.get("port")
         for f in app.get("_port_files", []):
             try:
+                if own is not None and f.read_text(encoding="utf-8").strip() != str(own):
+                    continue
                 f.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
             except OSError as exc:
                 log.warning("serve.port cleanup failed for %s: %s", f, exc)
 
@@ -83,6 +99,7 @@ async def start_hook_server(
     port = _find_free_port()
     site = web.TCPSite(runner, host="127.0.0.1", port=port)
     await site.start()
+    bound["port"] = port
 
     port_file.parent.mkdir(parents=True, exist_ok=True)
     port_file.write_text(str(port), encoding="utf-8")
