@@ -4,10 +4,12 @@ Issue #66: stale serve.port files survived `cce serve` exits, and the next
 session's hooks would POST to a dead port. The on_cleanup hook now unlinks
 both the storage_base and rendezvous port files.
 """
+import threading
 from pathlib import Path
 
 import pytest
 
+from context_engine.memory import hook_server
 from context_engine.memory.hook_server import start_hook_server
 
 
@@ -113,3 +115,41 @@ async def test_cleanup_leaves_port_files_owned_by_another_server(tmp_path, monke
 
     assert not port_file.exists()
     assert not rendezvous.exists()
+
+
+@pytest.mark.asyncio
+async def test_peer_publishing_during_cleanup_keeps_its_rendezvous(tmp_path, monkeypatch):
+    """A peer publishing its port between this server's ownership read and
+    its unlink must not lose the rendezvous: publication waits on the same
+    lock as the compare-and-delete, so it lands after the unlink."""
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    storage_base = tmp_path / "storage"
+    storage_base.mkdir()
+    port_file = storage_base / "serve.port"
+    rendezvous = fake_home / ".cce" / "projects" / "proj_race" / "serve.port"
+
+    runner, _ = await start_hook_server(storage_base=storage_base, project_name="proj_race")
+
+    peer_port = 1
+    peer = threading.Thread(
+        target=hook_server._publish_port,
+        args=([port_file, rendezvous], peer_port, storage_base / hook_server.PORT_LOCK_NAME),
+    )
+    real_read_text = Path.read_text
+
+    def read_then_peer_publishes(self, *args, **kwargs):
+        text = real_read_text(self, *args, **kwargs)
+        if self == port_file and not peer.is_alive() and peer.ident is None:
+            peer.start()
+            peer.join(timeout=0.3)  # without the lock the peer writes right here
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read_then_peer_publishes)
+    await runner.cleanup()
+    monkeypatch.setattr(Path, "read_text", real_read_text)
+    peer.join(timeout=5)
+
+    assert port_file.read_text() == str(peer_port)
+    assert rendezvous.read_text() == str(peer_port)

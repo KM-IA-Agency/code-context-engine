@@ -9,9 +9,19 @@ process). Stopped gracefully on shutdown.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import socket
+import time
+from collections.abc import Iterator
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 
 from aiohttp import web
 
@@ -19,6 +29,73 @@ from context_engine.memory import db as memory_db
 from context_engine.memory.hooks import add_routes
 
 log = logging.getLogger(__name__)
+
+
+# Name of the lock file, next to the authoritative serve.port, that serializes
+# every publication and every compare-and-delete of the port files across the
+# `cce serve` processes of one project.
+PORT_LOCK_NAME = "serve.port.lock"
+_PORT_LOCK_TIMEOUT_S = 2.0
+
+
+@contextlib.contextmanager
+def _port_files_lock(lock_path: Path, timeout: float = _PORT_LOCK_TIMEOUT_S) -> Iterator[bool]:
+    """Hold an exclusive cross-process lock on `lock_path`; yields whether it is held.
+
+    Without it, another server could publish its port between this server's
+    "does the file still hold my port?" read and its unlink, and lose its
+    rendezvous. Gives up after `timeout` (yields False) rather than hang a
+    startup or a shutdown on a wedged peer.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    held = False
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                held = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    log.warning("serve.port lock busy after %.1fs: %s", timeout, lock_path)
+                    break
+                time.sleep(0.02)
+        yield held
+    finally:
+        if held:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def _publish_port(port_files: list[Path], port: int, lock_path: Path) -> None:
+    """Write `port` to every port file, under the port-files lock."""
+    with _port_files_lock(lock_path):
+        written: set[Path] = set()
+        for f in port_files:
+            try:
+                key = f.resolve()
+                if key in written:
+                    continue
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(str(port), encoding="utf-8")
+                written.add(key)
+            except OSError as exc:
+                # Non-fatal for the rendezvous copy — capture still works for
+                # users with default storage.
+                log.warning("serve.port write failed for %s: %s", f, exc)
 
 
 def _find_free_port() -> int:
@@ -46,6 +123,7 @@ async def start_hook_server(
 
     # Authoritative port file lives in the project's storage_base.
     port_file = Path(storage_base) / "serve.port"
+    lock_path = Path(storage_base) / PORT_LOCK_NAME
     # Stable rendezvous file at the *default* storage location. The hook
     # shell script always looks here (`${HOME}/.cce/projects/<name>/serve.port`)
     # because it has no way to read the user's config.yaml. When storage_path
@@ -80,15 +158,23 @@ async def start_hook_server(
         # that still holds *this* server's port, or the survivors' hooks
         # lose their rendezvous.
         own = bound.get("port")
-        for f in app.get("_port_files", []):
-            try:
-                if own is not None and f.read_text(encoding="utf-8").strip() != str(own):
-                    continue
-                f.unlink(missing_ok=True)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                log.warning("serve.port cleanup failed for %s: %s", f, exc)
+        # Compare-and-delete under the same lock as publication, so a peer
+        # cannot write its port between the read and the unlink.
+        with _port_files_lock(lock_path) as held:
+            if not held and own is not None:
+                # Unknown state: leave the files rather than risk deleting a
+                # peer's rendezvous (a stale file is caught by the hook's
+                # socket-liveness probe).
+                return
+            for f in app.get("_port_files", []):
+                try:
+                    if own is not None and f.read_text(encoding="utf-8").strip() != str(own):
+                        continue
+                    f.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    log.warning("serve.port cleanup failed for %s: %s", f, exc)
 
     app.on_cleanup.append(_close_db)
     app.on_cleanup.append(_unlink_port_files)
@@ -101,16 +187,7 @@ async def start_hook_server(
     await site.start()
     bound["port"] = port
 
-    port_file.parent.mkdir(parents=True, exist_ok=True)
-    port_file.write_text(str(port), encoding="utf-8")
-
-    try:
-        if default_rendezvous.resolve() != port_file.resolve():
-            default_rendezvous.parent.mkdir(parents=True, exist_ok=True)
-            default_rendezvous.write_text(str(port), encoding="utf-8")
-    except OSError as exc:
-        # Non-fatal — capture still works for users with default storage.
-        log.warning("rendezvous port file write failed: %s", exc)
+    _publish_port([port_file, default_rendezvous], port, lock_path)
 
     log.info("Memory hook server listening on 127.0.0.1:%d", port)
     return runner, port
